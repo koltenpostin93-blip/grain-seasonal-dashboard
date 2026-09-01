@@ -417,6 +417,203 @@ def render_seasonal_futures(commodity: dict, api_key: str, as_of: date, report_d
         st.caption(note)
 
 
+MAX_SPREAD_LEGS = 6
+
+
+def _leg_label(code: str, ticker: str, sign: int) -> str:
+    return f"{'+' if sign > 0 else '−'}{friendly_contract(ticker, code)}"
+
+
+def _spread_label(legs: list[tuple[str, str, int]]) -> str:
+    return " / ".join(_leg_label(c, t, s) for c, t, s in legs)
+
+
+def _combine_series(hist: dict[str, pd.Series], legs: list[tuple[str, str, int]]) -> pd.Series | None:
+    """legs: list of (product_code, ticker, sign). Combines each leg's settle
+    series on their overlapping sessions; None if any leg has no history."""
+    series_list = []
+    for _, ticker, _ in legs:
+        s = hist.get(ticker)
+        if s is None or not len(s):
+            return None
+        series_list.append(s)
+    combined = pd.concat({i: s for i, s in enumerate(series_list)}, axis=1).dropna()
+    if combined.empty:
+        return None
+    return sum(sign * combined[i] for i, (_, _, sign) in enumerate(legs))
+
+
+def render_leg_picker(curves: dict[str, pd.DataFrame], state_key: str,
+                      cross_commodity: bool) -> list[tuple[str, str, int]] | None:
+    """Renders one row per leg (commodity picker only if cross_commodity, always a
+    contract picker + Buy/Sell side except leg 1 which is the fixed +1 anchor),
+    plus +/− buttons that grow or shrink the leg count. Returns the picked legs
+    as (product_code, ticker, sign), or None if a row can't be completed yet
+    (e.g. a commodity has no live contracts). For a fixed (non-cross-commodity)
+    spread, `curves` holds exactly one product_code -> curve entry."""
+    n_legs_key = f"{state_key}_nlegs"
+    n_legs = st.session_state.setdefault(n_legs_key, 2)
+    fixed_code = None if cross_commodity else next(iter(curves))
+
+    legs: list[tuple[str, str, int]] = []
+    complete = True
+    for i in range(n_legs):
+        row = st.container(horizontal=True, vertical_alignment="bottom")
+        with row:
+            if cross_commodity:
+                names = [c["label"] for c in COMMODITIES]
+                pick = st.selectbox(f"Leg {i + 1}", names, index=min(i, len(COMMODITIES) - 1),
+                                    key=f"{state_key}_c{i}", width=170)
+                code = COMMODITIES[names.index(pick)]["product_code"]
+            else:
+                code = fixed_code
+            curve = curves.get(code, pd.DataFrame())
+            tickers = list(curve["ticker"]) if not curve.empty else []
+            if not tickers:
+                st.warning(f"No live contracts for {code}.")
+                complete = False
+                continue
+            ticker = st.selectbox(
+                "Contract" if cross_commodity else f"Leg {i + 1}", tickers,
+                index=min(i, len(tickers) - 1), key=f"{state_key}_t{i}", width=150,
+                format_func=lambda t, code=code: friendly_contract(t, code),
+            )
+            if i == 0:
+                sign = 1
+                st.caption("Buy (anchor)")
+            else:
+                side = st.segmented_control("Side", ["Buy", "Sell"], default="Sell",
+                                            key=f"{state_key}_side{i}")
+                sign = 1 if (side or "Sell") == "Buy" else -1
+        legs.append((code, ticker, sign))
+
+    btns = st.container(horizontal=True)
+    with btns:
+        if st.button("+ Add leg", key=f"{state_key}_add", disabled=n_legs >= MAX_SPREAD_LEGS):
+            st.session_state[n_legs_key] = n_legs + 1
+            st.rerun()
+        if st.button("− Remove leg", key=f"{state_key}_rm", disabled=n_legs <= 2):
+            st.session_state[n_legs_key] = n_legs - 1
+            st.rerun()
+
+    return legs if complete else None
+
+
+def render_spread_charts(legs: list[tuple[str, str, int]], api_key: str, as_of: date,
+                         expiries_by_product: dict[str, dict[str, date]], years_back: int,
+                         show_avg: bool, window_label: str, unit: str,
+                         report_dates: dict | None, key: str):
+    """Shared recent-history + seasonal-overlay rendering for both the
+    per-commodity calendar spread (fixed product_code across legs) and the
+    cross-commodity spread builder (each leg its own product_code)."""
+    window_days = WINDOW_CHOICES.get(window_label or "1Y", 365)
+    label = _spread_label(legs)
+    y_title = f"Spread ({unit})"
+    anchor_code, anchor_ticker, _ = legs[0]
+    anchor_expiry = expiries_by_product.get(anchor_code, {}).get(anchor_ticker)
+    if anchor_expiry is None:
+        st.warning("Couldn't resolve the first leg's expiration.")
+        return
+
+    year_legsets: list[list[tuple[str, str, int]]] = []
+    for back in range(years_back + 1):
+        shifted = []
+        ok = True
+        for code, ticker, sign in legs:
+            t = shift_ticker_year(ticker, code, -back)
+            if not t:
+                ok = False
+                break
+            shifted.append((code, t, sign))
+        if ok:
+            year_legsets.append(shifted)
+
+    all_tickers = tuple(sorted({t for legset in year_legsets for _, t, _ in legset}))
+    hist = load_histories(all_tickers, api_key)
+
+    st.caption(f"**{label}** — recent history")
+    current_series = _combine_series(hist, year_legsets[0]) if year_legsets else None
+    if current_series is None:
+        st.info("No overlapping settlement history for this spread.")
+    else:
+        cutoff = as_of - timedelta(days=window_days)
+        shown = current_series[current_series.index >= cutoff]
+        if not len(shown):
+            st.info(f"No sessions inside the {window_label} window.")
+        else:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=list(shown.index), y=list(shown.values), mode="lines", name=label,
+                line=dict(color=YEAR_COLORS[0], width=2), showlegend=False,
+                hovertemplate="%{x|%b %d, %Y}<br>%{y:+.2f}<extra></extra>",
+            ))
+            if report_dates:
+                _add_report_markers(fig, report_dates, shown.index.min(), shown.index.max())
+            _style_axes(fig, y_title, None)
+            st.plotly_chart(fig, width="stretch", key=f"sp_hist_{key}",
+                            config=plotly_config(f"{key}_history"))
+            export_row(shown.rename("spread").reset_index().rename(columns={"index": "date"}),
+                       f"{key}_history", key=f"sphist_{key}")
+
+    st.caption(f"**{label}** — seasonal, aligned on leg 1 expiration")
+    fig = go.Figure()
+    by_dte: dict[str, pd.Series] = {}
+    skipped: list[str] = []
+
+    for back, legset in enumerate(year_legsets):
+        spread = _combine_series(hist, legset)
+        if spread is None:
+            skipped.append(_spread_label(legset))
+            continue
+        leg0_code, leg0_ticker, _ = legset[0]
+        leg0_expiry = expiries_by_product.get(leg0_code, {}).get(leg0_ticker, spread.index.max())
+        dte = [-(leg0_expiry - d).days for d in spread.index]
+        keep = [i for i, d in enumerate(dte) if d >= -window_days]
+        if not keep:
+            skipped.append(_spread_label(legset))
+            continue
+
+        xs_dte = [dte[i] for i in keep]
+        xs = [anchor_expiry + timedelta(days=d) for d in xs_dte]
+        ys = [spread.values[i] for i in keep]
+        name = _spread_label(legset) + (" (current)" if back == 0 else "")
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="lines", name=name,
+            line=dict(color=YEAR_COLORS[back % len(YEAR_COLORS)], width=3 if back == 0 else 1.5),
+            opacity=1.0 if back == 0 else 0.75,
+            hovertemplate=f"{name}<br>%{{y:+.2f}}<extra></extra>",
+        ))
+        by_dte[_spread_label(legset)] = pd.Series(ys, index=pd.Index(xs_dte, name="dte"))
+
+    if not by_dte:
+        st.info("No overlapping settlement history for this spread's prior-year analogs.")
+    else:
+        if show_avg and len(by_dte) > 1:
+            avg = _year_grid_average(by_dte, window_days)
+            if len(avg):
+                fig.add_trace(go.Scatter(
+                    x=[anchor_expiry + timedelta(days=int(d)) for d in avg.index],
+                    y=list(avg.values), mode="lines", name=f"Avg ({len(by_dte)}yr)",
+                    line=dict(color=AVG_COLOR, width=2.2, dash="dot"),
+                    hovertemplate="Avg<br>%{y:+.2f}<extra></extra>",
+                ))
+        if as_of <= anchor_expiry:
+            _add_vline(fig, anchor_expiry, "leg 1 expiration", EXP_COLOR)
+            _add_vline(fig, grain_fnd(anchor_expiry), "leg 1 FND", FND_COLOR)
+        _style_axes(fig, y_title, None)
+        st.plotly_chart(fig, width="stretch", key=f"sp_seas_{key}",
+                        config=plotly_config(f"{key}_seasonal"))
+        export_row(pd.DataFrame(by_dte).sort_index().reset_index(),
+                   f"{key}_seasonal", key=f"spseas_{key}")
+        note = (
+            f"{len(by_dte)} contract year{'s' if len(by_dte) != 1 else ''} overlaid · x = 0 is "
+            f"leg 1's expiration, so every year lines up at the same point in its life."
+        )
+        if skipped:
+            note += f" No usable history for {', '.join(skipped)}."
+        st.caption(note)
+
+
 def render_seasonal_spread(commodity: dict, api_key: str, as_of: date, report_dates: dict | None = None):
     code = commodity["product_code"]
     key = commodity["key"]
@@ -431,123 +628,20 @@ def render_seasonal_spread(commodity: dict, api_key: str, as_of: date, report_da
         st.warning(f"{commodity['label']}: not enough live contracts to build a spread.")
         return
 
-    tickers = list(curve["ticker"])
-    expiries = dict(zip(curve["ticker"], curve["expiration"]))
+    legs = render_leg_picker({code: curve}, f"sp_{key}", cross_commodity=False)
 
-    row = st.container(horizontal=True, vertical_alignment="bottom")
-    with row:
-        near = st.selectbox("Near leg", tickers[:-1], key=f"sp_near_{key}", width=150,
-                            format_func=lambda t: friendly_contract(t, code))
-        later = [t for t in tickers if expiries[t] > expiries[near]]
-        far = st.selectbox("Far leg", later, key=f"sp_far_{key}", width=150,
-                           format_func=lambda t: friendly_contract(t, code))
+    controls = st.container(horizontal=True, vertical_alignment="bottom")
+    with controls:
         years_back = st.slider("Prior years", 1, MAX_YEARS_BACK, 4, key=f"sp_years_{key}", width=170)
         show_avg = st.toggle("Average", value=True, key=f"sp_avg_{key}")
         window_label = st.segmented_control("Window", list(WINDOW_CHOICES), default="1Y", key=f"sp_win_{key}")
 
-    if not far:
-        st.info("Pick a far leg that expires after the near leg.")
+    if not legs:
         return
 
-    window_days = WINDOW_CHOICES.get(window_label or "1Y", 365)
-    anchor_expiry = expiries[near]
-    label = f"{friendly_contract(near, code)} / {friendly_contract(far, code)}"
-    y_title = f"Spread ({unit})"
-
-    shifted_pairs = []
-    for back in range(years_back + 1):
-        n = shift_ticker_year(near, code, -back)
-        f = shift_ticker_year(far, code, -back)
-        if n and f:
-            shifted_pairs.append((n, f))
-    tickers_needed = tuple(sorted({t for pair in shifted_pairs for t in pair}))
-    hist = load_histories(tickers_needed, api_key)
-
-    st.caption(f"**{label}** — recent history")
-    near_h, far_h = hist.get(near), hist.get(far)
-    if near_h is None or far_h is None or not len(near_h) or not len(far_h):
-        st.info("No overlapping settlement history for this pair.")
-    else:
-        spread = (near_h - far_h).dropna()
-        cutoff = as_of - timedelta(days=window_days)
-        shown = spread[spread.index >= cutoff]
-        if not len(shown):
-            st.info(f"No sessions inside the {window_label} window.")
-        else:
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=list(shown.index), y=list(shown.values), mode="lines", name=label,
-                line=dict(color=YEAR_COLORS[0], width=2), showlegend=False,
-                hovertemplate="%{x|%b %d, %Y}<br>%{y:+.2f}<extra></extra>",
-            ))
-            if report_dates:
-                _add_report_markers(fig, report_dates, shown.index.min(), shown.index.max())
-            _style_axes(fig, y_title, None)
-            st.plotly_chart(fig, width="stretch", key=f"sp_hist_{key}",
-                            config=plotly_config(f"{key}_{near}_{far}_history"))
-            export_row(shown.rename("spread").reset_index().rename(columns={"index": "date"}),
-                       f"{key}_{near}_{far}_history", key=f"sphist_{key}")
-
-    st.caption(f"**{label}** — seasonal, aligned on near-leg expiration")
-    fig = go.Figure()
-    by_dte: dict[str, pd.Series] = {}
-    skipped: list[str] = []
-
-    for back, (n, f) in enumerate(shifted_pairs):
-        n_h, f_h = hist.get(n), hist.get(f)
-        if n_h is None or f_h is None or not len(n_h) or not len(f_h):
-            skipped.append(f"{n}/{f}")
-            continue
-        spread = (n_h - f_h).dropna()
-        if not len(spread):
-            skipped.append(f"{n}/{f}")
-            continue
-        near_expiry = expiries.get(n, n_h.index.max())
-        dte = [-(near_expiry - d).days for d in spread.index]
-        keep = [i for i, d in enumerate(dte) if d >= -window_days]
-        if not keep:
-            skipped.append(f"{n}/{f}")
-            continue
-
-        xs_dte = [dte[i] for i in keep]
-        xs = [anchor_expiry + timedelta(days=d) for d in xs_dte]
-        ys = [spread.values[i] for i in keep]
-        name = f"{n}/{f}" + (" (current)" if back == 0 else "")
-        fig.add_trace(go.Scatter(
-            x=xs, y=ys, mode="lines", name=name,
-            line=dict(color=YEAR_COLORS[back % len(YEAR_COLORS)], width=3 if back == 0 else 1.5),
-            opacity=1.0 if back == 0 else 0.75,
-            hovertemplate=f"{name}<br>%{{y:+.2f}}<extra></extra>",
-        ))
-        by_dte[f"{n}/{f}"] = pd.Series(ys, index=pd.Index(xs_dte, name="dte"))
-
-    if not by_dte:
-        st.info("No overlapping settlement history for this pair's prior-year analogs.")
-    else:
-        if show_avg and len(by_dte) > 1:
-            avg = _year_grid_average(by_dte, window_days)
-            if len(avg):
-                fig.add_trace(go.Scatter(
-                    x=[anchor_expiry + timedelta(days=int(d)) for d in avg.index],
-                    y=list(avg.values), mode="lines", name=f"Avg ({len(by_dte)}yr)",
-                    line=dict(color=AVG_COLOR, width=2.2, dash="dot"),
-                    hovertemplate="Avg<br>%{y:+.2f}<extra></extra>",
-                ))
-        if as_of <= anchor_expiry:
-            _add_vline(fig, anchor_expiry, "near expiration", EXP_COLOR)
-            _add_vline(fig, grain_fnd(anchor_expiry), "near FND", FND_COLOR)
-        _style_axes(fig, y_title, None)
-        st.plotly_chart(fig, width="stretch", key=f"sp_seas_{key}",
-                        config=plotly_config(f"{key}_{near}_{far}_seasonal"))
-        export_row(pd.DataFrame(by_dte).sort_index().reset_index(),
-                   f"{key}_{near}_{far}_seasonal", key=f"spseas_{key}")
-        note = (
-            f"{len(by_dte)} contract year{'s' if len(by_dte) != 1 else ''} overlaid · x = 0 is "
-            f"the near leg's expiration, so every year lines up at the same point in its life."
-        )
-        if skipped:
-            note += f" No usable history for {', '.join(skipped)}."
-        st.caption(note)
+    expiries = dict(zip(curve["ticker"], curve["expiration"]))
+    render_spread_charts(legs, api_key, as_of, {code: expiries}, years_back, show_avg,
+                         window_label, unit, report_dates, key=f"{key}_{'_'.join(t for _, t, _ in legs)}")
 
 
 def build_spread_matrix(curve: pd.DataFrame, code: str) -> tuple[pd.DataFrame, list[str]]:
@@ -739,6 +833,47 @@ def render_commodity(commodity: dict, api_key: str, as_of: date, report_dates: d
         render_spread_matrix(commodity, api_key, as_of)
     with tab_history:
         render_contract_history(commodity, api_key, as_of, report_dates)
+
+
+def render_cross_commodity_spread(api_key: str, as_of: date, report_dates: dict | None = None):
+    st.markdown("##### Cross-commodity spread")
+    st.caption(
+        "Spread any two or more commodities' contracts against each other — e.g. KC wheat "
+        "over corn, or soybeans over Chicago wheat — same leg builder as each commodity's "
+        "own Seasonal spread tab, but each leg picks its own commodity."
+    )
+
+    curves: dict[str, pd.DataFrame] = {}
+    expiries_by_product: dict[str, dict[str, date]] = {}
+    for c in COMMODITIES:
+        try:
+            curve = load_curve(c["product_code"], api_key, as_of.isoformat(), 10)
+        except MassiveApiError:
+            curve = pd.DataFrame()
+        curves[c["product_code"]] = curve
+        expiries_by_product[c["product_code"]] = (
+            dict(zip(curve["ticker"], curve["expiration"])) if not curve.empty else {}
+        )
+
+    legs = render_leg_picker(curves, "xsp", cross_commodity=True)
+
+    controls = st.container(horizontal=True, vertical_alignment="bottom")
+    with controls:
+        years_back = st.slider("Prior years", 1, MAX_YEARS_BACK, 4, key="xsp_years", width=170)
+        show_avg = st.toggle("Average", value=True, key="xsp_avg")
+        window_label = st.segmented_control("Window", list(WINDOW_CHOICES), default="1Y", key="xsp_win")
+
+    if not legs:
+        return
+
+    # ¢/bu for every commodity here; recompute rather than hardcode in case a
+    # future commodity is added in different units.
+    units = {c["product_code"]: c["unit"] for c in COMMODITIES}
+    unit = units.get(legs[0][0], "¢/bu")
+
+    render_spread_charts(legs, api_key, as_of, expiries_by_product, years_back, show_avg,
+                         window_label, unit, report_dates,
+                         key="xsp_" + "_".join(t for _, t, _ in legs))
 
 
 def render_report_calendar(wasde_dates: list[date], nass_dates: list[tuple[date, str]], as_of: date):
@@ -1006,12 +1141,14 @@ def main():
     )
     anthropic_key = get_anthropic_key()
 
-    tab_labels = [c["label"] for c in COMMODITIES] + ["Report calendar", "Ask AI"]
+    tab_labels = [c["label"] for c in COMMODITIES] + ["Cross-commodity spread", "Report calendar", "Ask AI"]
     tabs = st.tabs(tab_labels)
     for tab, commodity in zip(tabs, COMMODITIES):
         with tab:
             st.caption(commodity["sublabel"])
             render_commodity(commodity, api_key, as_of, report_dates_visible)
+    with tabs[-3]:
+        render_cross_commodity_spread(api_key, as_of, report_dates_visible)
     with tabs[-2]:
         render_report_calendar(wasde_dates, nass_dates, as_of)
     with tabs[-1]:
