@@ -1050,6 +1050,44 @@ SYSTEM_PROMPT_TEMPLATE = (
 )
 
 
+@st.fragment
+def render_ask_ai_chat(api_key: str, anthropic_key: str, as_of: date,
+                       wasde_dates: list[date], nass_dates: list[tuple[date, str]]):
+    """Isolated in a fragment so sending a message only reruns this box, not
+    the whole page — a full rerun re-fetches/re-renders all four commodities'
+    tabs too, which is far too slow to pay on every chat turn. Defined as a
+    real module-level function (not a closure inside render_ask_ai) since a
+    fresh closure object on every call is what triggers Streamlit's "fragment
+    does not exist anymore" error on some reruns — fragments need a stable
+    identity across reruns, which only a top-level function reliably gives."""
+    if st.session_state.chat_history and st.button("Clear chat", key="clear_chat"):
+        st.session_state.chat_history = []
+
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    question = st.chat_input("e.g. What's the average corn price 30 days before December expiration?")
+    if question:
+        st.session_state.chat_history.append({"role": "user", "content": question})
+        with st.chat_message("user"):
+            st.markdown(question)
+
+        client = anthropic.Anthropic(api_key=anthropic_key)
+        dispatch = make_tool_dispatch(api_key, as_of, wasde_dates, nass_dates)
+        system_prompt = SYSTEM_PROMPT_TEMPLATE.format(today=as_of.isoformat())
+        api_messages = [{"role": m["role"], "content": m["content"]} for m in st.session_state.chat_history]
+
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking…"):
+                try:
+                    answer = run_chat(client, api_messages, dispatch, system_prompt)
+                except Exception as e:
+                    answer = f"Error calling Claude: {e}"
+            st.markdown(answer)
+        st.session_state.chat_history.append({"role": "assistant", "content": answer})
+
+
 def render_ask_ai(api_key: str, anthropic_key: str, as_of: date,
                   wasde_dates: list[date], nass_dates: list[tuple[date, str]]):
     st.markdown("##### Ask AI")
@@ -1068,39 +1106,7 @@ def render_ask_ai(api_key: str, anthropic_key: str, as_of: date,
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
 
-    @st.fragment
-    def chat_fragment():
-        # Isolated in a fragment so sending a message only reruns this box,
-        # not the whole page — a full rerun re-fetches/re-renders all four
-        # commodities' tabs too, which is far too slow to pay on every turn.
-        if st.session_state.chat_history and st.button("Clear chat", key="clear_chat"):
-            st.session_state.chat_history = []
-
-        for msg in st.session_state.chat_history:
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
-
-        question = st.chat_input("e.g. What's the average corn price 30 days before December expiration?")
-        if question:
-            st.session_state.chat_history.append({"role": "user", "content": question})
-            with st.chat_message("user"):
-                st.markdown(question)
-
-            client = anthropic.Anthropic(api_key=anthropic_key)
-            dispatch = make_tool_dispatch(api_key, as_of, wasde_dates, nass_dates)
-            system_prompt = SYSTEM_PROMPT_TEMPLATE.format(today=as_of.isoformat())
-            api_messages = [{"role": m["role"], "content": m["content"]} for m in st.session_state.chat_history]
-
-            with st.chat_message("assistant"):
-                with st.spinner("Thinking…"):
-                    try:
-                        answer = run_chat(client, api_messages, dispatch, system_prompt)
-                    except Exception as e:
-                        answer = f"Error calling Claude: {e}"
-                st.markdown(answer)
-            st.session_state.chat_history.append({"role": "assistant", "content": answer})
-
-    chat_fragment()
+    render_ask_ai_chat(api_key, anthropic_key, as_of, wasde_dates, nass_dates)
 
 
 def main():
