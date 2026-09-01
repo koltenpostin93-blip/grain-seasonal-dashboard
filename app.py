@@ -3,11 +3,14 @@ import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import anthropic
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from ai_chat import run_chat
 from massive_api import MassiveApiError, get_daily_bars_many, get_futures_curve
+from report_dates import NASS_2021_FALLBACK, ReportDatesError, get_nass_dates, get_wasde_dates
 
 HERE = Path(__file__).parent
 
@@ -85,6 +88,14 @@ def get_api_key() -> str:
     return key or os.environ.get("MASSIVE_API_KEY", "")
 
 
+def get_anthropic_key() -> str:
+    try:
+        key = st.secrets.get("ANTHROPIC_API_KEY", "")
+    except Exception:
+        key = ""
+    return key or os.environ.get("ANTHROPIC_API_KEY", "")
+
+
 def friendly_contract(ticker: str, product_code: str) -> str:
     suffix = ticker[len(product_code):]
     if len(suffix) == 2 and suffix[0] in MONTH_LETTERS:
@@ -126,6 +137,22 @@ def load_histories(tickers: tuple[str, ...], api_key: str) -> dict[str, pd.Serie
     """Settlement-price view over load_bars, for the existing line-chart call sites."""
     bars_map = load_bars(tickers, api_key)
     return {t: b["settle"] for t, b in bars_map.items() if not b.empty}
+
+
+@st.cache_data(ttl="24h", show_spinner="Loading WASDE report dates…")
+def load_wasde_dates() -> list[date]:
+    try:
+        return get_wasde_dates()
+    except ReportDatesError:
+        return []
+
+
+@st.cache_data(ttl="24h", show_spinner="Loading NASS report calendar…")
+def load_nass_dates(years: tuple[int, ...]) -> list[tuple[date, str]]:
+    events = get_nass_dates(list(years))
+    if min(years) <= 2021:
+        events = events + NASS_2021_FALLBACK
+    return sorted(set(events))
 
 
 def plotly_config(filename: str) -> dict:
@@ -176,6 +203,45 @@ def _add_vline(fig, x, text, color):
                        yanchor="bottom", font=dict(size=10, color=color))
 
 
+REPORT_COLORS = {"WASDE": "#e8833a", "NASS": "#5aa469"}
+
+
+def _add_report_markers(fig, report_dates: dict[str, list[date]], start: date, end: date):
+    """Thin, unlabeled vertical lines for report-release dates inside [start, end],
+    one per date, with a single legend entry per source (shapes don't otherwise
+    appear in the legend, and per-line text annotations would clutter a chart
+    that can have a dozen+ release dates in view)."""
+    for name, dates in report_dates.items():
+        color = REPORT_COLORS.get(name, "#888888")
+        visible = [d for d in dates if start <= d <= end]
+        for d in visible:
+            x = pd.Timestamp(d)
+            fig.add_shape(type="line", xref="x", yref="paper", x0=x, x1=x, y0=0, y1=1,
+                          line=dict(color=color, dash="dot", width=1), opacity=0.55, layer="below")
+        if visible:
+            fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines",
+                                     line=dict(color=color, dash="dot", width=1.5),
+                                     name=f"{name} release", showlegend=True))
+
+
+def _selected_report_dates(wasde_dates: list[date], nass_dates: list[tuple[date, str]],
+                           show_wasde: bool, show_nass_major: bool,
+                           show_crop_progress: bool) -> dict[str, list[date]]:
+    out: dict[str, list[date]] = {}
+    if show_wasde and wasde_dates:
+        out["WASDE"] = wasde_dates
+    nass_selected = []
+    for d, label in nass_dates:
+        if label == "Crop Progress":
+            if show_crop_progress:
+                nass_selected.append(d)
+        elif show_nass_major:
+            nass_selected.append(d)
+    if nass_selected:
+        out["NASS"] = sorted(set(nass_selected))
+    return out
+
+
 def _style_axes(fig, y_title, x_title, height=420):
     wm = watermark_path()
     if wm:
@@ -213,13 +279,16 @@ def _year_grid_average(by_dte: dict[str, pd.Series], window_days: int) -> pd.Ser
     return frame.mean(axis=1, skipna=True)[frame.count(axis=1) >= required]
 
 
-def render_seasonal_futures(commodity: dict, api_key: str, as_of: date):
+def render_seasonal_futures(commodity: dict, api_key: str, as_of: date, report_dates: dict | None = None):
     code = commodity["product_code"]
     key = commodity["key"]
     unit = commodity["unit"]
 
     try:
-        curve = load_curve(code, api_key, as_of.isoformat(), 8)
+        # n_contracts matches the other sub-tabs (10) so they share one cached
+        # curve fetch per commodity instead of paying for the live-quote round
+        # trip twice.
+        curve = load_curve(code, api_key, as_of.isoformat(), 10)
     except MassiveApiError as e:
         st.error(f"Couldn't load {commodity['label']} quotes: {e}")
         return
@@ -266,14 +335,15 @@ def render_seasonal_futures(commodity: dict, api_key: str, as_of: date):
             fig = go.Figure()
             fig.add_trace(go.Scatter(
                 x=list(shown.index), y=list(shown.values), mode="lines", name=label,
-                line=dict(color=YEAR_COLORS[0], width=2),
+                line=dict(color=YEAR_COLORS[0], width=2), showlegend=False,
                 hovertemplate="%{x|%b %d, %Y}<br>%{y:.2f}<extra></extra>",
             ))
             if as_of <= anchor_expiry:
                 _add_vline(fig, anchor_expiry, "expiration", EXP_COLOR)
                 _add_vline(fig, grain_fnd(anchor_expiry), "FND", FND_COLOR)
+            if report_dates:
+                _add_report_markers(fig, report_dates, shown.index.min(), shown.index.max())
             _style_axes(fig, f"Price ({unit})", None)
-            fig.update_layout(showlegend=False)
             st.plotly_chart(fig, width="stretch", key=f"fut_hist_{key}",
                             config=plotly_config(f"{key}_{ticker}_history"))
             export_row(shown.rename("price").reset_index().rename(columns={"index": "date"}),
@@ -347,7 +417,7 @@ def render_seasonal_futures(commodity: dict, api_key: str, as_of: date):
         st.caption(note)
 
 
-def render_seasonal_spread(commodity: dict, api_key: str, as_of: date):
+def render_seasonal_spread(commodity: dict, api_key: str, as_of: date, report_dates: dict | None = None):
     code = commodity["product_code"]
     key = commodity["key"]
     unit = commodity["unit"]
@@ -407,11 +477,12 @@ def render_seasonal_spread(commodity: dict, api_key: str, as_of: date):
             fig = go.Figure()
             fig.add_trace(go.Scatter(
                 x=list(shown.index), y=list(shown.values), mode="lines", name=label,
-                line=dict(color=YEAR_COLORS[0], width=2),
+                line=dict(color=YEAR_COLORS[0], width=2), showlegend=False,
                 hovertemplate="%{x|%b %d, %Y}<br>%{y:+.2f}<extra></extra>",
             ))
+            if report_dates:
+                _add_report_markers(fig, report_dates, shown.index.min(), shown.index.max())
             _style_axes(fig, y_title, None)
-            fig.update_layout(showlegend=False)
             st.plotly_chart(fig, width="stretch", key=f"sp_hist_{key}",
                             config=plotly_config(f"{key}_{near}_{far}_history"))
             export_row(shown.rename("spread").reset_index().rename(columns={"index": "date"}),
@@ -504,7 +575,7 @@ def render_spread_matrix(commodity: dict, api_key: str, as_of: date):
         "(near price − far price). Positive = near trading over far (inverted); "
         "negative = near trading under far (normal carry-market shape)."
     )
-    n_load = st.slider("Contract months", 3, 10, 8, key=f"mx_months_{key}", width=200)
+    n_load = st.slider("Contract months", 3, 10, 10, key=f"mx_months_{key}", width=200)
 
     try:
         curve = load_curve(code, api_key, as_of.isoformat(), n_load)
@@ -566,13 +637,13 @@ def monthly_high_low(bars: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def render_contract_history(commodity: dict, api_key: str, as_of: date):
+def render_contract_history(commodity: dict, api_key: str, as_of: date, report_dates: dict | None = None):
     code = commodity["product_code"]
     key = commodity["key"]
     unit = commodity["unit"]
 
     try:
-        curve = load_curve(code, api_key, as_of.isoformat(), 8)
+        curve = load_curve(code, api_key, as_of.isoformat(), 10)
     except MassiveApiError as e:
         st.error(f"Couldn't load {commodity['label']} quotes: {e}")
         return
@@ -624,11 +695,14 @@ def render_contract_history(commodity: dict, api_key: str, as_of: date):
     st.caption(f"**{label}** — {timeframe or 'Weekly'} ({unit})")
     fig = go.Figure(go.Candlestick(
         x=list(plot_bars.index), open=plot_bars["open"], high=plot_bars["high"],
-        low=plot_bars["low"], close=plot_bars["close"],
+        low=plot_bars["low"], close=plot_bars["close"], showlegend=False,
         increasing_line_color=YEAR_COLORS[2], decreasing_line_color=EXP_COLOR, name=label,
     ))
+    if report_dates:
+        _add_report_markers(fig, report_dates, pd.Timestamp(plot_bars.index.min()).date(),
+                            pd.Timestamp(plot_bars.index.max()).date())
     _style_axes(fig, f"Price ({unit})", None, height=380)
-    fig.update_layout(showlegend=False, xaxis_rangeslider_visible=False)
+    fig.update_layout(xaxis_rangeslider_visible=False)
     st.plotly_chart(fig, width="stretch", key=f"hist_candle_{key}",
                     config=plotly_config(f"{key}_{target}_{timeframe}"))
     export_row(plot_bars.reset_index().rename(columns={"index": "date"}),
@@ -653,18 +727,239 @@ def render_contract_history(commodity: dict, api_key: str, as_of: date):
     )
 
 
-def render_commodity(commodity: dict, api_key: str, as_of: date):
+def render_commodity(commodity: dict, api_key: str, as_of: date, report_dates: dict | None = None):
     tab_futures, tab_spread, tab_matrix, tab_history = st.tabs(
         ["Seasonal futures", "Seasonal spread", "Spread matrix", "Contract history"]
     )
     with tab_futures:
-        render_seasonal_futures(commodity, api_key, as_of)
+        render_seasonal_futures(commodity, api_key, as_of, report_dates)
     with tab_spread:
-        render_seasonal_spread(commodity, api_key, as_of)
+        render_seasonal_spread(commodity, api_key, as_of, report_dates)
     with tab_matrix:
         render_spread_matrix(commodity, api_key, as_of)
     with tab_history:
-        render_contract_history(commodity, api_key, as_of)
+        render_contract_history(commodity, api_key, as_of, report_dates)
+
+
+def render_report_calendar(wasde_dates: list[date], nass_dates: list[tuple[date, str]], as_of: date):
+    st.markdown("##### Report release calendar")
+    st.caption(
+        "WASDE dates come from USDA's ESMIS report archive (esmis.nal.usda.gov) — the "
+        "authoritative release record, since WASDE does get rescheduled (e.g. Oct 2025's "
+        "report was cancelled outright by the government shutdown and folded into a "
+        "delayed Nov 14 release). NASS dates come from NASS's published .ics release "
+        "calendar (2022 onward); Sep–Dec 2021 is backfilled from the well-documented "
+        "release cadence rather than the live calendar, which doesn't reach that far back."
+    )
+
+    rows = [{"Date": d, "Report": "WASDE", "Source": "USDA WASDE"} for d in wasde_dates]
+    rows += [{"Date": d, "Report": label, "Source": "USDA NASS"} for d, label in nass_dates]
+    if not rows:
+        st.warning("No report dates loaded.")
+        return
+    frame = pd.DataFrame(rows).sort_values("Date", ascending=False)
+
+    report_types = sorted(frame["Report"].unique())
+    controls = st.container(horizontal=True, vertical_alignment="bottom")
+    with controls:
+        picked = st.multiselect(
+            "Report types", report_types,
+            default=[r for r in report_types if r != "Crop Progress"],
+            key="cal_report_types",
+        )
+        year_range = st.slider(
+            "Year", 2021, as_of.year, (max(2021, as_of.year - 1), as_of.year), key="cal_years",
+        )
+
+    filtered = frame[
+        frame["Report"].isin(picked)
+        & frame["Date"].apply(lambda d: year_range[0] <= d.year <= year_range[1])
+    ]
+    if filtered.empty:
+        st.info("No report dates match the current filters.")
+        return
+
+    display = filtered.copy()
+    display["Date"] = display["Date"].map(lambda d: d.strftime("%Y-%m-%d"))
+    with st.container(key="tablewrap_calendar"):
+        st.dataframe(display, hide_index=True, width="stretch",
+                    height=min(35 * (len(display) + 1) + 3, 620))
+    export_row(display, "report_calendar", key="calendar")
+    st.caption(f"{len(filtered):,} report dates shown, {year_range[0]}–{year_range[1]}.")
+
+
+def _tool_get_live_curve(args: dict, api_key: str, as_of: date) -> dict:
+    code = args["product_code"]
+    n = args.get("n_contracts", 8)
+    curve = load_curve(code, api_key, as_of.isoformat(), n)
+    if curve.empty:
+        return {"error": f"No live contracts returned for {code}."}
+    return {"contracts": [
+        {"ticker": r.ticker, "label": friendly_contract(r.ticker, code),
+         "expiration": r.expiration.isoformat(), "price": r.price}
+        for r in curve.itertuples(index=False)
+    ]}
+
+
+def _tool_get_contract_summary(args: dict, api_key: str, as_of: date) -> dict:
+    code, ticker = args["product_code"], args["ticker"]
+    bars = load_bars((ticker,), api_key).get(ticker)
+    if bars is None or bars.empty:
+        return {"error": f"No settlement history for {ticker}."}
+    hi_idx, lo_idx = bars["high"].idxmax(), bars["low"].idxmin()
+    return {
+        "ticker": ticker, "label": friendly_contract(ticker, code), "sessions": len(bars),
+        "first_date": str(bars.index.min()), "last_date": str(bars.index.max()),
+        "all_time_high": float(bars.loc[hi_idx, "high"]), "high_date": str(hi_idx),
+        "all_time_low": float(bars.loc[lo_idx, "low"]), "low_date": str(lo_idx),
+        "latest_settle": float(bars["settle"].iloc[-1]), "latest_date": str(bars.index[-1]),
+    }
+
+
+def _tool_get_monthly_high_low(args: dict, api_key: str, as_of: date) -> dict:
+    ticker = args["ticker"]
+    bars = load_bars((ticker,), api_key).get(ticker)
+    if bars is None or bars.empty:
+        return {"error": f"No settlement history for {ticker}."}
+    return {"ticker": ticker, "months": monthly_high_low(bars).to_dict(orient="records")}
+
+
+def _tool_get_price_on_date(args: dict, api_key: str, as_of: date) -> dict:
+    ticker = args["ticker"]
+    target = pd.Timestamp(args["target_date"]).date()
+    bars = load_bars((ticker,), api_key).get(ticker)
+    if bars is None or bars.empty:
+        return {"error": f"No settlement history for {ticker}."}
+    eligible = bars[pd.to_datetime(bars.index).date <= target]
+    if eligible.empty:
+        return {"error": f"No sessions on or before {target} for {ticker}."}
+    return {"ticker": ticker, "date": str(eligible.index[-1]), "settle": float(eligible["settle"].iloc[-1])}
+
+
+def _tool_get_seasonal_stats(args: dict, api_key: str, as_of: date) -> dict:
+    code, ticker = args["product_code"], args["ticker"]
+    years_back = min(args.get("years_back", 4), MAX_YEARS_BACK)
+    curve = load_curve(code, api_key, as_of.isoformat(), 8)
+    expiries = dict(zip(curve["ticker"], curve["expiration"])) if not curve.empty else {}
+    checkpoints = [90, 60, 30, 14, 7]
+    by_cp: dict[int, list[float]] = {cp: [] for cp in checkpoints}
+    for back in range(years_back + 1):
+        t = shift_ticker_year(ticker, code, -back)
+        if not t:
+            continue
+        bars = load_bars((t,), api_key).get(t)
+        if bars is None or bars.empty:
+            continue
+        expiry = expiries.get(t, bars.index.max())
+        dte = (pd.Timestamp(expiry) - pd.to_datetime(bars.index)).days
+        settle = bars["settle"].to_numpy()
+        for cp in checkpoints:
+            mask = (dte >= cp - 3) & (dte <= cp + 3)
+            if mask.any():
+                by_cp[cp].append(float(settle[mask][-1]))
+    return {
+        "ticker": ticker,
+        "checkpoints_days_to_expiry": {
+            str(cp): {"average": (sum(v) / len(v)) if v else None,
+                      "min": min(v) if v else None, "max": max(v) if v else None,
+                      "years_used": len(v)}
+            for cp, v in by_cp.items()
+        },
+    }
+
+
+def _tool_get_wasde_dates(args: dict, wasde_dates: list[date]) -> dict:
+    start, end = pd.Timestamp(args["start_date"]).date(), pd.Timestamp(args["end_date"]).date()
+    return {"dates": [str(d) for d in wasde_dates if start <= d <= end]}
+
+
+def _tool_get_nass_dates(args: dict, nass_dates: list[tuple[date, str]]) -> dict:
+    start, end = pd.Timestamp(args["start_date"]).date(), pd.Timestamp(args["end_date"]).date()
+    report_type = args.get("report_type")
+    rows = [{"date": str(d), "report": label} for d, label in nass_dates
+            if start <= d <= end and (not report_type or report_type.lower() in label.lower())]
+    return {"reports": rows}
+
+
+def make_tool_dispatch(api_key: str, as_of: date, wasde_dates: list[date],
+                       nass_dates: list[tuple[date, str]]):
+    def dispatch(name: str, args: dict) -> dict:
+        if name == "get_live_curve":
+            return _tool_get_live_curve(args, api_key, as_of)
+        if name == "get_contract_summary":
+            return _tool_get_contract_summary(args, api_key, as_of)
+        if name == "get_monthly_high_low":
+            return _tool_get_monthly_high_low(args, api_key, as_of)
+        if name == "get_price_on_date":
+            return _tool_get_price_on_date(args, api_key, as_of)
+        if name == "get_seasonal_stats":
+            return _tool_get_seasonal_stats(args, api_key, as_of)
+        if name == "get_wasde_dates":
+            return _tool_get_wasde_dates(args, wasde_dates)
+        if name == "get_nass_dates":
+            return _tool_get_nass_dates(args, nass_dates)
+        return {"error": f"Unknown tool {name}"}
+    return dispatch
+
+
+SYSTEM_PROMPT_TEMPLATE = (
+    "You are a grain-markets assistant embedded in a Streamlit dashboard covering CBOT corn (ZC), "
+    "soybeans (ZS), Chicago/SRW wheat (ZW), and KC/HRW wheat (KE) futures. Today's date is {today}.\n\n"
+    "You have tools to look up live and historical futures prices, monthly high/low stats for "
+    "specific contracts, and USDA WASDE/NASS report release dates. Use them whenever a question "
+    "needs real data — never guess a price or date from memory. When a question names a contract "
+    "loosely (e.g. \"December corn\" or \"the front month\"), resolve it via get_live_curve first, "
+    "then use the resulting ticker in other calls. Massive's settlement history starts 2021-09-02, "
+    "so anything requesting data before that will come back empty — say so rather than inventing "
+    "numbers. Keep answers concise and cite the specific numbers/dates your tools returned."
+)
+
+
+def render_ask_ai(api_key: str, anthropic_key: str, as_of: date,
+                  wasde_dates: list[date], nass_dates: list[tuple[date, str]]):
+    st.markdown("##### Ask AI")
+    st.caption(
+        "Ask about corn/soybean/wheat futures prices, monthly highs & lows, seasonal patterns, or "
+        "WASDE/NASS report dates. Answers are grounded in live tool calls, not guesses — Massive's "
+        "settlement history starts 2021-09-02."
+    )
+    if not anthropic_key:
+        st.info(
+            "Add an `ANTHROPIC_API_KEY` to `.streamlit/secrets.toml` "
+            '(`ANTHROPIC_API_KEY = "..."`) or as an environment variable to enable this tab.'
+        )
+        return
+
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+
+    if st.session_state.chat_history and st.button("Clear chat", key="clear_chat"):
+        st.session_state.chat_history = []
+        st.rerun()
+
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    question = st.chat_input("e.g. What's the average corn price 30 days before December expiration?")
+    if question:
+        st.session_state.chat_history.append({"role": "user", "content": question})
+        with st.chat_message("user"):
+            st.markdown(question)
+
+        client = anthropic.Anthropic(api_key=anthropic_key)
+        dispatch = make_tool_dispatch(api_key, as_of, wasde_dates, nass_dates)
+        system_prompt = SYSTEM_PROMPT_TEMPLATE.format(today=as_of.isoformat())
+        api_messages = [{"role": m["role"], "content": m["content"]} for m in st.session_state.chat_history]
+
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking…"):
+                try:
+                    answer = run_chat(client, api_messages, dispatch, system_prompt)
+                except Exception as e:
+                    answer = f"Error calling Claude: {e}"
+            st.markdown(answer)
+        st.session_state.chat_history.append({"role": "assistant", "content": answer})
 
 
 def main():
@@ -690,12 +985,37 @@ def main():
         st.stop()
 
     as_of = date.today()
+    wasde_dates = load_wasde_dates()
+    nass_dates = load_nass_dates(tuple(range(2021, as_of.year + 1)))
 
-    tabs = st.tabs([c["label"] for c in COMMODITIES])
+    with st.sidebar:
+        st.markdown("##### Report markers")
+        st.caption("Vertical lines on the price/candlestick charts.")
+        show_wasde = st.checkbox("WASDE", value=True, key="show_wasde")
+        show_nass_major = st.checkbox(
+            "NASS (major reports)", value=True, key="show_nass_major",
+            help="Crop Production, Grain Stocks, Acreage, Prospective Plantings, "
+                 "Winter Wheat & Canola Seedings, Small Grains Summary.",
+        )
+        show_crop_progress = st.checkbox(
+            "NASS Crop Progress (weekly)", value=False, key="show_crop_progress",
+            help="Off by default — weekly releases add a lot of lines.",
+        )
+    report_dates_visible = _selected_report_dates(
+        wasde_dates, nass_dates, show_wasde, show_nass_major, show_crop_progress
+    )
+    anthropic_key = get_anthropic_key()
+
+    tab_labels = [c["label"] for c in COMMODITIES] + ["Report calendar", "Ask AI"]
+    tabs = st.tabs(tab_labels)
     for tab, commodity in zip(tabs, COMMODITIES):
         with tab:
             st.caption(commodity["sublabel"])
-            render_commodity(commodity, api_key, as_of)
+            render_commodity(commodity, api_key, as_of, report_dates_visible)
+    with tabs[-2]:
+        render_report_calendar(wasde_dates, nass_dates, as_of)
+    with tabs[-1]:
+        render_ask_ai(api_key, anthropic_key, as_of, wasde_dates, nass_dates)
 
 
 if __name__ == "__main__":
