@@ -325,15 +325,33 @@ def _year_grid_align(by_dte: dict[str, pd.Series], window_days: int) -> pd.DataF
 SEASONAL_STRENGTH_COLORS = {5: "#e8833a", 10: "#0693e3", "all": "#111111"}
 
 
+SEASONAL_STRENGTH_SMOOTH_DAYS = 5
+
+
 def _seasonal_strength(by_dte: dict[str, pd.Series], window_days: int,
                        lookbacks: list[int]) -> dict[int, pd.Series]:
     """Our own 'seasonal strength' metric — % of years where price sat above
-    its own window-start level at each aligned day, across a few lookback
+    a common baseline level at each aligned day, across a few lookback
     depths. This is an independently-defined win-rate measure, not a
-    reverse-engineering of any vendor's proprietary formula: we simply
-    normalize each year to its own starting level (a plain cumulative-return
-    sign check) and count how often, historically, the market was up from
-    there by this point in the season.
+    reverse-engineering of any vendor's proprietary formula: we normalize
+    every included year to the same starting reference point (a plain
+    cumulative-return sign check from there) and count how often,
+    historically, the market was up from there by this point in the season.
+
+    That reference point has to be a genuinely SHARED one — the earliest
+    grid day where every year in this lookback actually has data — not each
+    year's own individual first day. Years have very different data depths
+    (a full-life Massive contract can run 500+ sessions; the bundled legacy
+    corn/soybean file only covers each contract's last ~300), so anchoring
+    each column to its own start would measure some years from ~a year out
+    and others from ~10 months out — different points in the season entirely
+    — and produce a noisy, apples-to-oranges comparison rather than a real
+    signal. The result is also lightly smoothed (a
+    SEASONAL_STRENGTH_SMOOTH_DAYS-session rolling average): a handful-of-
+    years win rate can only take a few discrete values (1/5 = 20% steps for
+    a 5-year lookback), so the raw daily series is inherently blocky —
+    smoothing doesn't add information, it just reads the way a percentage
+    with a handful of possible values should: as a trend, not a staircase.
 
     `by_dte` is assumed ordered most-recent-year first (back=0 first), which
     is how every caller already builds it — `lookbacks[i]` years back means
@@ -346,12 +364,17 @@ def _seasonal_strength(by_dte: dict[str, pd.Series], window_days: int,
         if len(cols) < 2:
             continue
         sub = frame[cols]
-        base = sub.bfill().iloc[0]  # each column's first real (non-NaN) value
-        pct_change = sub.subtract(base, axis=1).divide(base, axis=1)
+        common = sub.dropna(how="any")
+        if common.empty:
+            continue
+        base = common.iloc[0]
+        pct_change = sub.loc[common.index[0]:].subtract(base, axis=1).divide(base, axis=1)
         counts = pct_change.notna().sum(axis=1)
         wins = (pct_change > 0).sum(axis=1)
-        rate = (wins / counts * 100).where(counts >= 2)
-        out[n] = rate.dropna()
+        rate = (wins / counts * 100).where(counts >= 2).dropna()
+        if len(rate) > SEASONAL_STRENGTH_SMOOTH_DAYS:
+            rate = rate.rolling(SEASONAL_STRENGTH_SMOOTH_DAYS, center=True, min_periods=1).mean()
+        out[n] = rate
     return out
 
 
