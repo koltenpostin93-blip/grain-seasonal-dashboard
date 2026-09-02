@@ -68,9 +68,15 @@ TOOLS = [
     },
     {
         "name": "get_seasonal_stats",
-        "description": "How a contract has behaved seasonally: average/min/max settlement price at "
-                        "several fixed points before expiration (90/60/30/14/7 calendar days out), "
-                        "averaged across its prior-year analogs (e.g. this Dec corn vs. the last 4 Decembers).",
+        "description": "How a contract has behaved seasonally: at several fixed points before "
+                        "expiration (90/60/30/14/7 calendar days out), returns the plain average/min/max "
+                        "settlement price across its prior-year analogs (e.g. this Dec corn vs. the last "
+                        "4 Decembers), plus a 'harmonic_fit' value at each checkpoint — a smooth Fourier "
+                        "regression fit across all those years that separates each year's own price level "
+                        "from the shared seasonal shape, so it isn't skewed the way a plain average can be "
+                        "by one outlier year (a drought spike, a trade-war shock). Prefer harmonic_fit over "
+                        "average when asked for 'the' seasonal price or a smoothed/typical seasonal level; "
+                        "use average/min/max when asked for the historical range itself.",
         "input_schema": {
             "type": "object",
             "properties": {

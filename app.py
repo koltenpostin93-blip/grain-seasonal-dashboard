@@ -1095,8 +1095,12 @@ def _tool_get_seasonal_stats(args: dict, api_key: str, as_of: date) -> dict:
     years_back = min(args.get("years_back", 4), MAX_YEARS_BACK)
     curve = load_curve(code, api_key, as_of.isoformat(), 8)
     expiries = dict(zip(curve["ticker"], curve["expiration"])) if not curve.empty else {}
-    checkpoints = [90, 60, 30, 14, 7]
+    checkpoints = [90, 60, 30, 14, 7]  # calendar days before expiration
+
+    # by_dte uses the same sign convention as the chart code (negative = before
+    # expiration, 0 = expiration) so it can feed _harmonic_seasonal_curve directly.
     by_cp: dict[int, list[float]] = {cp: [] for cp in checkpoints}
+    by_dte: dict[str, pd.Series] = {}
     for back in range(years_back + 1):
         t = shift_ticker_year(ticker, code, -back)
         if not t:
@@ -1105,18 +1109,30 @@ def _tool_get_seasonal_stats(args: dict, api_key: str, as_of: date) -> dict:
         if bars is None or bars.empty:
             continue
         expiry = expiries.get(t, bars.index.max())
-        dte = (pd.Timestamp(expiry) - pd.to_datetime(bars.index)).days
+        dte_days = [-(expiry - d).days for d in bars.index]
         settle = bars["settle"].to_numpy()
+        by_dte[t] = pd.Series(settle, index=pd.Index(dte_days, name="dte"))
         for cp in checkpoints:
-            mask = (dte >= cp - 3) & (dte <= cp + 3)
-            if mask.any():
-                by_cp[cp].append(float(settle[mask][-1]))
+            matches = [i for i, d in enumerate(dte_days) if abs(d - (-cp)) <= 3]
+            if matches:
+                by_cp[cp].append(float(settle[matches[-1]]))
+
+    harmonic_curve = _harmonic_seasonal_curve(by_dte, window_days=100) if len(by_dte) > 1 else pd.Series(dtype=float)
+
+    def harmonic_at(cp: int) -> float | None:
+        if harmonic_curve.empty:
+            return None
+        target = -cp
+        nearest = min(harmonic_curve.index, key=lambda d: abs(d - target))
+        return float(harmonic_curve.loc[nearest])
+
     return {
         "ticker": ticker,
         "checkpoints_days_to_expiry": {
             str(cp): {"average": (sum(v) / len(v)) if v else None,
                       "min": min(v) if v else None, "max": max(v) if v else None,
-                      "years_used": len(v)}
+                      "years_used": len(v),
+                      "harmonic_fit": harmonic_at(cp)}
             for cp, v in by_cp.items()
         },
     }
