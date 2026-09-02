@@ -10,6 +10,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from ai_chat import run_chat
+from legacy_history import get_legacy_series, load_legacy_history
 from massive_api import MassiveApiError, get_daily_bars_many, get_futures_curve
 from report_dates import NASS_2021_FALLBACK, ReportDatesError, get_nass_dates, get_wasde_dates
 
@@ -60,10 +61,12 @@ YEAR_COLORS = ["#0693e3", "#e8833a", "#5aa469", "#b05fb0", "#9aa5b1", "#c0392b"]
 AVG_COLOR = "#111111"
 EXP_COLOR = "#c62828"
 FND_COLOR = "#8e24aa"
-MAX_YEARS_BACK = 5
+MAX_YEARS_BACK = 18  # legacy corn/soybean history (see legacy_history.py) reaches back to 2008
 DATA_START_NOTE = (
-    "Massive's daily settlement history starts 2021-09-02, so seasonal overlays "
-    "cover roughly the last 4 full contract years — older analogs are skipped, not wrong."
+    "Massive's daily settlement history starts 2021-09-02. Corn and soybeans get a deeper "
+    "backfill from a bundled reference file reaching to 2008 (settlement price only, no "
+    "OHLC — Chicago/KC wheat aren't covered by that file, so those still cap out around "
+    "4 years); years past whatever's available are skipped, not wrong."
 )
 FND_NOTE = (
     "FND marks the CME grain rule's First Notice Day — the last business day of the "
@@ -101,6 +104,10 @@ def friendly_contract(ticker: str, product_code: str) -> str:
     suffix = ticker[len(product_code):]
     if len(suffix) == 2 and suffix[0] in MONTH_LETTERS:
         return f"{MONTH_LETTERS[suffix[0]]} '2{suffix[1]}"
+    # Legacy-history labels are "<month letter><4-digit year>" (e.g. "Z2016"),
+    # unambiguous where Massive's single-digit-year tickers can't reach this far back.
+    if len(suffix) == 5 and suffix[0] in MONTH_LETTERS and suffix[1:].isdigit():
+        return f"{MONTH_LETTERS[suffix[0]]} '{suffix[3:]}"
     return ticker
 
 
@@ -114,6 +121,44 @@ def shift_ticker_year(ticker: str, product_code: str, delta: int) -> str | None:
     if shifted < 0:
         return None
     return f"{product_code}{month}{shifted % 10}"
+
+
+@st.cache_data(show_spinner=False)
+def load_legacy_history_cached() -> pd.DataFrame:
+    return load_legacy_history()
+
+
+def _resolve_year_series(hist: dict[str, pd.Series], code: str, ticker: str, back: int,
+                         base_year: int, legacy: pd.DataFrame) -> tuple[pd.Series | None, str]:
+    """Settlement series for one specific historical contract-year of `ticker`,
+    `back` years before `base_year`. Checks Massive (via the already-shifted
+    single-digit-year ticker, looked up in the batch-fetched `hist` dict) and
+    the bundled pre-2021 legacy CSV (corn/soybeans only — see
+    legacy_history.py), and returns whichever actually has more sessions.
+
+    They aren't simply "recent vs. old": for the single transition year
+    around Massive's ~2021-09-02 data floor, Massive only has the tail of
+    that contract's life (e.g. ~69 sessions) while the legacy file has that
+    same contract's fuller ~248-300-session window — so a plain "prefer
+    Massive if it has anything" would silently downgrade that one year.
+    Comparing lengths picks the richer source either way.
+
+    Returns (series or None, a display label — the real ticker when Massive's
+    series wins, else a "<month letter><4-digit year>" legacy label)."""
+    shifted = shift_ticker_year(ticker, code, -back)
+    massive_s = hist.get(shifted) if shifted else None
+    massive_n = len(massive_s) if massive_s is not None else 0
+
+    month_letter = ticker[len(code)] if len(ticker) > len(code) else ""
+    target_year = base_year - back
+    legacy_s = (get_legacy_series(legacy, code, month_letter, target_year)
+               if month_letter else pd.Series(dtype=float))
+
+    if len(legacy_s) > massive_n:
+        return legacy_s, f"{code}{month_letter}{target_year}"
+    if massive_n:
+        return massive_s, shifted
+    return None, shifted or f"{code}{month_letter}{target_year}"
 
 
 @st.cache_data(ttl="5m", show_spinner=False)
@@ -486,16 +531,16 @@ def render_seasonal_futures(commodity: dict, api_key: str, as_of: date, report_d
     fig = go.Figure()
     by_dte: dict[str, pd.Series] = {}
     skipped: list[str] = []
+    legacy = load_legacy_history_cached()
+    base_year = anchor_expiry.year
 
     for back in range(years_back + 1):
-        t = shift_ticker_year(ticker, code, -back)
-        if not t:
-            continue
-        series = hist.get(t)
+        series, t = _resolve_year_series(hist, code, ticker, back, base_year, legacy)
         if series is None or not len(series):
             skipped.append(t)
             continue
-        year_expiry = expiries.get(t, series.index.max())
+        shifted_ticker = shift_ticker_year(ticker, code, -back)
+        year_expiry = expiries.get(shifted_ticker, series.index.max()) if shifted_ticker else series.index.max()
         dte = [-(year_expiry - d).days for d in series.index]
         keep = [i for i, d in enumerate(dte) if d >= -window_days]
         if not keep:
@@ -640,24 +685,39 @@ def render_spread_charts(legs: list[tuple[str, str, int]], api_key: str, as_of: 
         st.warning("Couldn't resolve the first leg's expiration.")
         return
 
+    legacy = load_legacy_history_cached()
+    base_years = {
+        (code, ticker): expiries_by_product.get(code, {}).get(ticker, as_of).year
+        for code, ticker, _ in legs
+    }
+
+    # Prefetch every Massive ticker any leg might need across all requested
+    # years — a batch fetch, same as before the legacy backfill existed.
+    all_tickers: set[str] = set()
+    for back in range(years_back + 1):
+        for code, ticker, _ in legs:
+            t = shift_ticker_year(ticker, code, -back)
+            if t:
+                all_tickers.add(t)
+    hist = load_histories(tuple(sorted(all_tickers)), api_key)
+
+    resolved: dict[str, pd.Series] = {}
     year_legsets: list[list[tuple[str, str, int]]] = []
     for back in range(years_back + 1):
-        shifted = []
+        legset = []
         ok = True
         for code, ticker, sign in legs:
-            t = shift_ticker_year(ticker, code, -back)
-            if not t:
+            series, t_label = _resolve_year_series(hist, code, ticker, back, base_years[(code, ticker)], legacy)
+            if series is None:
                 ok = False
                 break
-            shifted.append((code, t, sign))
+            resolved[t_label] = series
+            legset.append((code, t_label, sign))
         if ok:
-            year_legsets.append(shifted)
-
-    all_tickers = tuple(sorted({t for legset in year_legsets for _, t, _ in legset}))
-    hist = load_histories(all_tickers, api_key)
+            year_legsets.append(legset)
 
     st.caption(f"**{label}** — recent history")
-    current_series = _combine_series(hist, year_legsets[0]) if year_legsets else None
+    current_series = _combine_series(resolved, year_legsets[0]) if year_legsets else None
     if current_series is None:
         st.info("No overlapping settlement history for this spread.")
     else:
@@ -686,7 +746,7 @@ def render_spread_charts(legs: list[tuple[str, str, int]], api_key: str, as_of: 
     skipped: list[str] = []
 
     for back, legset in enumerate(year_legsets):
-        spread = _combine_series(hist, legset)
+        spread = _combine_series(resolved, legset)
         if spread is None:
             skipped.append(_spread_label(legset))
             continue
@@ -1096,26 +1156,34 @@ def _tool_get_seasonal_stats(args: dict, api_key: str, as_of: date) -> dict:
     curve = load_curve(code, api_key, as_of.isoformat(), 8)
     expiries = dict(zip(curve["ticker"], curve["expiration"])) if not curve.empty else {}
     checkpoints = [90, 60, 30, 14, 7]  # calendar days before expiration
+    base_year = expiries.get(ticker, as_of).year
+
+    # Massive-fetchable tickers only (shift_ticker_year returns None past its
+    # single-digit-year range); older years fall back to the bundled legacy
+    # corn/soybean history via _resolve_year_series below.
+    massive_tickers = tuple(t for t in
+                            (shift_ticker_year(ticker, code, -b) for b in range(years_back + 1)) if t)
+    hist = load_histories(massive_tickers, api_key)
+    legacy = load_legacy_history_cached()
 
     # by_dte uses the same sign convention as the chart code (negative = before
     # expiration, 0 = expiration) so it can feed _harmonic_seasonal_curve directly.
     by_cp: dict[int, list[float]] = {cp: [] for cp in checkpoints}
     by_dte: dict[str, pd.Series] = {}
     for back in range(years_back + 1):
-        t = shift_ticker_year(ticker, code, -back)
-        if not t:
+        series, t = _resolve_year_series(hist, code, ticker, back, base_year, legacy)
+        if series is None or not len(series):
             continue
-        bars = load_bars((t,), api_key).get(t)
-        if bars is None or bars.empty:
-            continue
-        expiry = expiries.get(t, bars.index.max())
-        dte_days = [-(expiry - d).days for d in bars.index]
-        settle = bars["settle"].to_numpy()
-        by_dte[t] = pd.Series(settle, index=pd.Index(dte_days, name="dte"))
+        shifted_ticker = shift_ticker_year(ticker, code, -back)
+        year_expiry = (expiries.get(shifted_ticker, series.index.max())
+                       if shifted_ticker else series.index.max())
+        dte_days = [-(year_expiry - d).days for d in series.index]
+        values = series.to_numpy()
+        by_dte[t] = pd.Series(values, index=pd.Index(dte_days, name="dte"))
         for cp in checkpoints:
             matches = [i for i, d in enumerate(dte_days) if abs(d - (-cp)) <= 3]
             if matches:
-                by_cp[cp].append(float(settle[matches[-1]]))
+                by_cp[cp].append(float(values[matches[-1]]))
 
     harmonic_curve = _harmonic_seasonal_curve(by_dte, window_days=100) if len(by_dte) > 1 else pd.Series(dtype=float)
 

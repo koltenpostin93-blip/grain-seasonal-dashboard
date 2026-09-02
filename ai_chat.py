@@ -82,7 +82,10 @@ TOOLS = [
             "properties": {
                 "product_code": {"type": "string", "enum": ["ZC", "ZS", "ZW", "KE"]},
                 "ticker": {"type": "string", "description": "the reference contract, e.g. ZCZ6"},
-                "years_back": {"type": "integer", "description": "prior contract years to include, default 4, max 5"},
+                "years_back": {"type": "integer", "description": "prior contract years to include, default 4, "
+                                                                  "max 18 for corn/soybeans (a bundled reference "
+                                                                  "file backfills those to 2008), max ~5 for wheat "
+                                                                  "(Massive's live data only)"},
             },
             "required": ["product_code", "ticker"],
         },
