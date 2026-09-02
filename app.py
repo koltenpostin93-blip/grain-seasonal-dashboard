@@ -1338,9 +1338,9 @@ def main():
     wasde_dates = load_wasde_dates()
     nass_dates = load_nass_dates(tuple(range(2021, as_of.year + 1)))
 
-    with st.sidebar:
-        st.markdown("##### Report markers")
-        st.caption("Vertical lines on the price/candlestick charts.")
+    st.caption("Report markers — vertical lines on the price/candlestick charts:")
+    marker_row = st.container(horizontal=True, vertical_alignment="center")
+    with marker_row:
         show_wasde = st.checkbox("WASDE", value=True, key="show_wasde")
         show_nass_major = st.checkbox(
             "NASS (major reports)", value=True, key="show_nass_major",
