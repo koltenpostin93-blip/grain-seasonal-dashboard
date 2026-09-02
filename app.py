@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import anthropic
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -301,13 +302,70 @@ def _year_grid_median_band(by_dte: dict[str, pd.Series], window_days: int,
     return stats[enough]
 
 
+HARMONIC_PERIOD_DAYS = 365.25
+HARMONIC_TERMS = 2  # fundamental annual cycle + one overtone; keeps the fit smooth rather than wiggly
+
+
+def _harmonic_seasonal_curve(by_dte: dict[str, pd.Series], window_days: int,
+                             n_harmonics: int = HARMONIC_TERMS) -> pd.Series:
+    """Fits one smooth seasonal curve by pooling every overlaid year's (dte,
+    price) points into a single regression, rather than aggregating them
+    pointwise the way Average/Median do.
+
+    Different years sit at completely different price levels (2022's drought
+    corn vs. 2024's), so pooling raw prices into a plain sin/cos regression
+    would just fit cross-year drift, not within-year seasonality. The fix is
+    a per-year fixed effect (one dummy variable per contract year) plus
+    harmonic terms shared across all years: the dummies absorb each year's
+    price level, leaving the sin/cos coefficients to capture only the common
+    seasonal shape. The returned curve is that shared shape added back onto
+    the current (back=0) year's own fitted level, so it reads in the same
+    price terms as the other traces — "where this year's contract would sit
+    if it were tracking the typical seasonal path."
+    """
+    years = list(by_dte.keys())
+    if len(years) < 2:
+        return pd.Series(dtype=float)
+
+    xs, ys, year_idx = [], [], []
+    for i, s in enumerate(by_dte.values()):
+        clean = s[~s.index.duplicated(keep="last")].dropna()
+        xs.extend(clean.index.to_numpy(dtype=float))
+        ys.extend(clean.to_numpy(dtype=float))
+        year_idx.extend([i] * len(clean))
+    xs = np.asarray(xs)
+    ys = np.asarray(ys)
+    year_idx = np.asarray(year_idx)
+    if len(xs) < 4 * n_harmonics + len(years):
+        return pd.Series(dtype=float)  # not enough points to fit this many parameters
+
+    n_years = len(years)
+    year_dummies = np.zeros((len(xs), n_years))
+    year_dummies[np.arange(len(xs)), year_idx] = 1
+    harmonic_cols = []
+    for k in range(1, n_harmonics + 1):
+        harmonic_cols.append(np.sin(2 * np.pi * k * xs / HARMONIC_PERIOD_DAYS))
+        harmonic_cols.append(np.cos(2 * np.pi * k * xs / HARMONIC_PERIOD_DAYS))
+    design = np.column_stack([year_dummies, *harmonic_cols])
+    coefs, *_ = np.linalg.lstsq(design, ys, rcond=None)
+
+    current_level = coefs[0]  # by_dte's insertion order is back=0 (current year) first
+    harmonic_coefs = coefs[n_years:]
+    grid = np.arange(-window_days, 1)
+    grid_cols = []
+    for k in range(1, n_harmonics + 1):
+        grid_cols.append(np.sin(2 * np.pi * k * grid / HARMONIC_PERIOD_DAYS))
+        grid_cols.append(np.cos(2 * np.pi * k * grid / HARMONIC_PERIOD_DAYS))
+    fitted = current_level + np.column_stack(grid_cols) @ harmonic_coefs
+    return pd.Series(fitted, index=pd.Index(grid, name="dte"))
+
+
 # "Off" skips any cross-year summary line. "Average" is the original plain
-# mean. "Median + bands" is the new outlier-resistant option. A future
-# "Harmonic" option (Fourier regression on day-of-year, for an actual
-# forward-looking seasonal forecast rather than a backward-looking overlay)
-# slots in here later — the dispatch in _add_seasonal_overlay is written so
-# adding it is a new elif branch, not a restructure.
-SEASONAL_LINE_CHOICES = ["Off", "Average", "Median + bands"]
+# mean. "Median + bands" resists distortion from a single outlier year.
+# "Harmonic" fits one smooth seasonal shape (Fourier regression on day-of-
+# year, pooled across years with per-year fixed effects) rather than
+# aggregating years pointwise.
+SEASONAL_LINE_CHOICES = ["Off", "Average", "Median + bands", "Harmonic"]
 
 
 def _add_seasonal_overlay(fig, by_dte: dict[str, pd.Series], window_days: int,
@@ -330,6 +388,17 @@ def _add_seasonal_overlay(fig, by_dte: dict[str, pd.Series], window_days: int,
                                  name=f"Median ({len(by_dte)}yr)",
                                  line=dict(color=AVG_COLOR, width=2.2, dash="dot"),
                                  hovertemplate=f"Median<br>%{{y:{fmt}}}<extra></extra>"))
+        return
+    if seasonal_line == "Harmonic":
+        curve = _harmonic_seasonal_curve(by_dte, window_days)
+        if not len(curve):
+            return
+        fig.add_trace(go.Scatter(
+            x=[anchor_expiry + timedelta(days=int(d)) for d in curve.index],
+            y=list(curve.values), mode="lines", name=f"Harmonic fit ({len(by_dte)}yr)",
+            line=dict(color=AVG_COLOR, width=2.2, dash="dot"),
+            hovertemplate=f"Harmonic<br>%{{y:{fmt}}}<extra></extra>",
+        ))
         return
     # default / "Average"
     avg = _year_grid_average(by_dte, window_days)
