@@ -265,18 +265,81 @@ def _style_axes(fig, y_title, x_title, height=420):
 WINDOW_CHOICES = {"6M": 183, "1Y": 365, "18M": 548}
 
 
-def _year_grid_average(by_dte: dict[str, pd.Series], window_days: int) -> pd.Series:
-    """Put every year on a common daily grid, then average only where most years
-    are present — avoids the mean lurching between 'all years' and 'one lonely year'
-    at the edges of the window."""
+def _year_grid_align(by_dte: dict[str, pd.Series], window_days: int) -> pd.DataFrame:
+    """Put every year on a common daily grid so they can be combined pointwise —
+    shared by both the mean and the median/percentile-band summaries below."""
     grid = pd.RangeIndex(-window_days, 1)
     aligned = {}
     for name, s in by_dte.items():
         clean = s[~s.index.duplicated(keep="last")].sort_index()
         aligned[name] = clean.reindex(grid).interpolate(limit_area="inside")
-    frame = pd.DataFrame(aligned)
-    required = max(2, (len(aligned) + 1) // 2)
+    return pd.DataFrame(aligned)
+
+
+def _year_grid_average(by_dte: dict[str, pd.Series], window_days: int) -> pd.Series:
+    """Mean across years at each grid point, restricted to points where most
+    years are present — avoids the mean lurching between 'all years' and 'one
+    lonely year' at the edges of the window."""
+    frame = _year_grid_align(by_dte, window_days)
+    required = max(2, (len(by_dte) + 1) // 2)
     return frame.mean(axis=1, skipna=True)[frame.count(axis=1) >= required]
+
+
+def _year_grid_median_band(by_dte: dict[str, pd.Series], window_days: int,
+                           band: tuple[float, float] = (0.25, 0.75)) -> pd.DataFrame:
+    """Median plus a lower/upper percentile band across years at each grid
+    point — resists distortion from any single outlier year (a drought spike,
+    a trade-war shock) the way a plain mean can't."""
+    frame = _year_grid_align(by_dte, window_days)
+    required = max(2, (len(by_dte) + 1) // 2)
+    enough = frame.count(axis=1) >= required
+    stats = pd.DataFrame({
+        "median": frame.median(axis=1, skipna=True),
+        "lower": frame.quantile(band[0], axis=1),
+        "upper": frame.quantile(band[1], axis=1),
+    })
+    return stats[enough]
+
+
+# "Off" skips any cross-year summary line. "Average" is the original plain
+# mean. "Median + bands" is the new outlier-resistant option. A future
+# "Harmonic" option (Fourier regression on day-of-year, for an actual
+# forward-looking seasonal forecast rather than a backward-looking overlay)
+# slots in here later — the dispatch in _add_seasonal_overlay is written so
+# adding it is a new elif branch, not a restructure.
+SEASONAL_LINE_CHOICES = ["Off", "Average", "Median + bands"]
+
+
+def _add_seasonal_overlay(fig, by_dte: dict[str, pd.Series], window_days: int,
+                          seasonal_line: str, anchor_expiry: date, fmt: str):
+    """Draws the chosen cross-year summary on top of the individual year
+    traces already added to fig."""
+    if seasonal_line == "Off" or len(by_dte) <= 1:
+        return
+    if seasonal_line == "Median + bands":
+        stats = _year_grid_median_band(by_dte, window_days)
+        if not len(stats):
+            return
+        xs = [anchor_expiry + timedelta(days=int(d)) for d in stats.index]
+        fig.add_trace(go.Scatter(x=xs, y=list(stats["upper"]), mode="lines",
+                                 line=dict(width=0), showlegend=False, hoverinfo="skip"))
+        fig.add_trace(go.Scatter(x=xs, y=list(stats["lower"]), mode="lines", line=dict(width=0),
+                                 fill="tonexty", fillcolor="rgba(17,17,17,0.12)",
+                                 name=f"25–75th pct ({len(by_dte)}yr)", hoverinfo="skip"))
+        fig.add_trace(go.Scatter(x=xs, y=list(stats["median"]), mode="lines",
+                                 name=f"Median ({len(by_dte)}yr)",
+                                 line=dict(color=AVG_COLOR, width=2.2, dash="dot"),
+                                 hovertemplate=f"Median<br>%{{y:{fmt}}}<extra></extra>"))
+        return
+    # default / "Average"
+    avg = _year_grid_average(by_dte, window_days)
+    if len(avg):
+        fig.add_trace(go.Scatter(
+            x=[anchor_expiry + timedelta(days=int(d)) for d in avg.index],
+            y=list(avg.values), mode="lines", name=f"Avg ({len(by_dte)}yr)",
+            line=dict(color=AVG_COLOR, width=2.2, dash="dot"),
+            hovertemplate=f"Avg<br>%{{y:{fmt}}}<extra></extra>",
+        ))
 
 
 def render_seasonal_futures(commodity: dict, api_key: str, as_of: date, report_dates: dict | None = None):
@@ -309,7 +372,8 @@ def render_seasonal_futures(commodity: dict, api_key: str, as_of: date, report_d
         indexed = st.toggle("Indexed (start = 100)", value=False, key=f"fut_idx_{key}",
                             help="Rebase each year to 100 at the start of the window, so years with "
                                  "very different price levels can be compared on shape alone.")
-        show_avg = st.toggle("Average", value=True, key=f"fut_avg_{key}")
+        seasonal_line = st.segmented_control("Seasonal line", SEASONAL_LINE_CHOICES,
+                                             default="Average", key=f"fut_avgmode_{key}")
         window_label = st.segmented_control("Window", list(WINDOW_CHOICES), default="1Y", key=f"fut_win_{key}")
 
     window_days = WINDOW_CHOICES.get(window_label or "1Y", 365)
@@ -391,15 +455,7 @@ def render_seasonal_futures(commodity: dict, api_key: str, as_of: date, report_d
     if not by_dte:
         st.info("No settlement history available for this contract's prior-year analogs.")
     else:
-        if show_avg and len(by_dte) > 1:
-            avg = _year_grid_average(by_dte, window_days)
-            if len(avg):
-                fig.add_trace(go.Scatter(
-                    x=[anchor_expiry + timedelta(days=int(d)) for d in avg.index],
-                    y=list(avg.values), mode="lines", name=f"Avg ({len(by_dte)}yr)",
-                    line=dict(color=AVG_COLOR, width=2.2, dash="dot"),
-                    hovertemplate=f"Avg<br>%{{y:{fmt}}}<extra></extra>",
-                ))
+        _add_seasonal_overlay(fig, by_dte, window_days, seasonal_line or "Average", anchor_expiry, fmt)
         if as_of <= anchor_expiry:
             _add_vline(fig, anchor_expiry, "expiration", EXP_COLOR)
             _add_vline(fig, grain_fnd(anchor_expiry), "FND", FND_COLOR)
@@ -501,7 +557,7 @@ def render_leg_picker(curves: dict[str, pd.DataFrame], state_key: str,
 
 def render_spread_charts(legs: list[tuple[str, str, int]], api_key: str, as_of: date,
                          expiries_by_product: dict[str, dict[str, date]], years_back: int,
-                         show_avg: bool, window_label: str, unit: str,
+                         seasonal_line: str, window_label: str, unit: str,
                          report_dates: dict | None, key: str):
     """Shared recent-history + seasonal-overlay rendering for both the
     per-commodity calendar spread (fixed product_code across legs) and the
@@ -588,15 +644,7 @@ def render_spread_charts(legs: list[tuple[str, str, int]], api_key: str, as_of: 
     if not by_dte:
         st.info("No overlapping settlement history for this spread's prior-year analogs.")
     else:
-        if show_avg and len(by_dte) > 1:
-            avg = _year_grid_average(by_dte, window_days)
-            if len(avg):
-                fig.add_trace(go.Scatter(
-                    x=[anchor_expiry + timedelta(days=int(d)) for d in avg.index],
-                    y=list(avg.values), mode="lines", name=f"Avg ({len(by_dte)}yr)",
-                    line=dict(color=AVG_COLOR, width=2.2, dash="dot"),
-                    hovertemplate="Avg<br>%{y:+.2f}<extra></extra>",
-                ))
+        _add_seasonal_overlay(fig, by_dte, window_days, seasonal_line or "Average", anchor_expiry, "+.2f")
         if as_of <= anchor_expiry:
             _add_vline(fig, anchor_expiry, "leg 1 expiration", EXP_COLOR)
             _add_vline(fig, grain_fnd(anchor_expiry), "leg 1 FND", FND_COLOR)
@@ -633,14 +681,15 @@ def render_seasonal_spread(commodity: dict, api_key: str, as_of: date, report_da
     controls = st.container(horizontal=True, vertical_alignment="bottom")
     with controls:
         years_back = st.slider("Prior years", 1, MAX_YEARS_BACK, 4, key=f"sp_years_{key}", width=170)
-        show_avg = st.toggle("Average", value=True, key=f"sp_avg_{key}")
+        seasonal_line = st.segmented_control("Seasonal line", SEASONAL_LINE_CHOICES,
+                                             default="Average", key=f"sp_avgmode_{key}")
         window_label = st.segmented_control("Window", list(WINDOW_CHOICES), default="1Y", key=f"sp_win_{key}")
 
     if not legs:
         return
 
     expiries = dict(zip(curve["ticker"], curve["expiration"]))
-    render_spread_charts(legs, api_key, as_of, {code: expiries}, years_back, show_avg,
+    render_spread_charts(legs, api_key, as_of, {code: expiries}, years_back, seasonal_line or "Average",
                          window_label, unit, report_dates, key=f"{key}_{'_'.join(t for _, t, _ in legs)}")
 
 
@@ -860,7 +909,8 @@ def render_cross_commodity_spread(api_key: str, as_of: date, report_dates: dict 
     controls = st.container(horizontal=True, vertical_alignment="bottom")
     with controls:
         years_back = st.slider("Prior years", 1, MAX_YEARS_BACK, 4, key="xsp_years", width=170)
-        show_avg = st.toggle("Average", value=True, key="xsp_avg")
+        seasonal_line = st.segmented_control("Seasonal line", SEASONAL_LINE_CHOICES,
+                                             default="Average", key="xsp_avgmode")
         window_label = st.segmented_control("Window", list(WINDOW_CHOICES), default="1Y", key="xsp_win")
 
     if not legs:
@@ -871,7 +921,7 @@ def render_cross_commodity_spread(api_key: str, as_of: date, report_dates: dict 
     units = {c["product_code"]: c["unit"] for c in COMMODITIES}
     unit = units.get(legs[0][0], "¢/bu")
 
-    render_spread_charts(legs, api_key, as_of, expiries_by_product, years_back, show_avg,
+    render_spread_charts(legs, api_key, as_of, expiries_by_product, years_back, seasonal_line or "Average",
                          window_label, unit, report_dates,
                          key="xsp_" + "_".join(t for _, t, _ in legs))
 
