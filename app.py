@@ -322,6 +322,77 @@ def _year_grid_align(by_dte: dict[str, pd.Series], window_days: int) -> pd.DataF
     return pd.DataFrame(aligned)
 
 
+SEASONAL_STRENGTH_COLORS = {5: "#e8833a", 10: "#0693e3", "all": "#111111"}
+
+
+def _seasonal_strength(by_dte: dict[str, pd.Series], window_days: int,
+                       lookbacks: list[int]) -> dict[int, pd.Series]:
+    """Our own 'seasonal strength' metric — % of years where price sat above
+    its own window-start level at each aligned day, across a few lookback
+    depths. This is an independently-defined win-rate measure, not a
+    reverse-engineering of any vendor's proprietary formula: we simply
+    normalize each year to its own starting level (a plain cumulative-return
+    sign check) and count how often, historically, the market was up from
+    there by this point in the season.
+
+    `by_dte` is assumed ordered most-recent-year first (back=0 first), which
+    is how every caller already builds it — `lookbacks[i]` years back means
+    the first `lookbacks[i]` entries."""
+    frame = _year_grid_align(by_dte, window_days)
+    labels_in_order = list(by_dte.keys())
+    out: dict[int, pd.Series] = {}
+    for n in lookbacks:
+        cols = labels_in_order[:n]
+        if len(cols) < 2:
+            continue
+        sub = frame[cols]
+        base = sub.bfill().iloc[0]  # each column's first real (non-NaN) value
+        pct_change = sub.subtract(base, axis=1).divide(base, axis=1)
+        counts = pct_change.notna().sum(axis=1)
+        wins = (pct_change > 0).sum(axis=1)
+        rate = (wins / counts * 100).where(counts >= 2)
+        out[n] = rate.dropna()
+    return out
+
+
+def render_seasonal_strength(by_dte: dict[str, pd.Series], window_days: int, anchor_expiry: date, key: str):
+    """A second panel below the main seasonal overlay: our own seasonal
+    'win rate' oscillator (0-100%) across a few lookback depths, in the
+    spirit of (but not copied from) the classic vendor seasonal-pattern
+    charts that pair a price overlay with a multi-lookback strength index."""
+    n_years = len(by_dte)
+    lookbacks = sorted({n for n in (5, 10, n_years) if n <= n_years and n >= 2})
+    if not lookbacks:
+        return
+    strengths = _seasonal_strength(by_dte, window_days, lookbacks)
+    if not strengths:
+        return
+
+    st.caption(
+        "**Seasonal strength** — at each point in the window, the % of years whose price was above "
+        "its own level at the start of the window (each year measured against itself, not against "
+        "the others), shown across a few lookback depths."
+    )
+    fig = go.Figure()
+    for n in lookbacks:
+        s = strengths.get(n)
+        if s is None or not len(s):
+            continue
+        color = SEASONAL_STRENGTH_COLORS.get(n, SEASONAL_STRENGTH_COLORS["all"])
+        name = f"{n}yr" if n != n_years else f"All ({n}yr)"
+        xs = [anchor_expiry + timedelta(days=int(d)) for d in s.index]
+        fig.add_trace(go.Scatter(
+            x=xs, y=list(s.values), mode="lines", name=name,
+            line=dict(color=color, width=2),
+            hovertemplate=f"{name}<br>%{{y:.0f}}%<extra></extra>",
+        ))
+    fig.add_hline(y=50, line_dash="dot", line_color="#9aa5b1", line_width=1)
+    _style_axes(fig, "Win rate (%)", None, height=260)
+    fig.update_yaxes(range=[0, 100])
+    st.plotly_chart(fig, width="stretch", key=f"strength_{key}",
+                    config=plotly_config(f"{key}_seasonal_strength"))
+
+
 def _year_grid_average(by_dte: dict[str, pd.Series], window_days: int) -> pd.Series:
     """Mean across years at each grid point, restricted to points where most
     years are present — avoids the mean lurching between 'all years' and 'one
@@ -585,6 +656,8 @@ def render_seasonal_futures(commodity: dict, api_key: str, as_of: date, report_d
         if skipped:
             note += f" No usable history for {', '.join(skipped)}."
         st.caption(note)
+
+        render_seasonal_strength(by_dte, window_days, anchor_expiry, key=f"{key}_{ticker}")
 
 
 MAX_SPREAD_LEGS = 6
